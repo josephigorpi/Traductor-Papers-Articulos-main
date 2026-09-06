@@ -1,0 +1,6 @@
+{
+  "name": "Academic Paper Translator",
+  "description": "Traductor de documentos y papers académicos en PDF a DOCX con Google Gemini y LangChain",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
