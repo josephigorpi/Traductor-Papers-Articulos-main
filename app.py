@@ -9,7 +9,12 @@ import io
 import re
 import zipfile
 from typing import List, Tuple, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
+
+# Número máximo de solicitudes simultáneas a Gemini.
+# Se mantiene controlado para evitar saturar la API.
+MAX_CONCURRENT_REQUESTS = 5
 
 # Librerías para extracción de PDF
 try:
@@ -297,6 +302,92 @@ def translate_chunk_direct(
     if response and response.text:
         return response.text.strip()
     return chunk
+
+
+def translate_chunks_concurrent(
+    chunks: List[str],
+    target_language: str,
+    api_key: str,
+    model_name: str = "gemini-3.6-flash",
+    max_workers: int = MAX_CONCURRENT_REQUESTS,
+    progress_callback=None,
+    live_callback=None
+) -> List[str]:
+    """
+    Traduce múltiples fragmentos de forma concurrente utilizando
+    un número controlado de trabajadores.
+
+    Los resultados se mantienen en el mismo orden que los chunks originales.
+
+    Args:
+        chunks: Lista de fragmentos a traducir.
+        target_language: Idioma de destino.
+        api_key: API Key de Gemini.
+        model_name: Modelo de Gemini.
+        max_workers: Número máximo de solicitudes simultáneas.
+        progress_callback: Función opcional para reportar progreso.
+        live_callback: Función opcional para mostrar resultados.
+
+    Returns:
+        Lista de traducciones en el mismo orden de entrada.
+    """
+
+    if not chunks:
+        return []
+
+    # Reservar espacio para mantener el orden original.
+    translated_chunks = [None] * len(chunks)
+
+    # Número de fragmentos que ya terminaron.
+    completed = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+
+        # Crear todas las tareas.
+        future_to_index = {
+            executor.submit(
+                translate_chunk_direct,
+                chunk=chunk,
+                target_language=target_language,
+                api_key=api_key,
+                model_name=model_name
+            ): index
+            for index, chunk in enumerate(chunks)
+        }
+
+        # Procesar resultados conforme van terminando.
+        for future in as_completed(future_to_index):
+
+            chunk_index = future_to_index[future]
+
+            try:
+                result = future.result()
+
+                # Guardar en su posición original.
+                translated_chunks[chunk_index] = result
+
+            except Exception as e:
+                # Si un chunk falla, conservar el texto original
+                # para no perder todo el documento.
+                translated_chunks[chunk_index] = chunks[chunk_index]
+
+                st.warning(
+                    f"⚠️ Error traduciendo el fragmento "
+                    f"{chunk_index + 1}: {str(e)}"
+                )
+
+            completed += 1
+
+            # Informar progreso.
+            if progress_callback:
+                progress_callback(
+                    completed,
+                    len(chunks),
+                    chunk_index,
+                    translated_chunks[chunk_index]
+                )
+
+    return translated_chunks
 
 
 # =============================================================================
@@ -666,56 +757,101 @@ def main():
                     st.warning(f"No se pudieron generar fragmentos de texto para `{file_name}`.")
                     continue
 
-                # 3. Traducción fragmento a fragmento con visualización en vivo
-                translated_chunks: List[str] = []
-
-                for chunk_idx, chunk in enumerate(chunks):
-                    # Actualizar progreso
-                    current_overall = (doc_idx + (chunk_idx / total_chunks)) / total_files
-                    overall_progress_bar.progress(min(current_overall, 1.0))
+                # 3. Traducción concurrente con visualización en vivo
+                translated_chunks: List[str] = [None] * total_chunks
+                
+                
+                def update_translation_progress(
+                    completed: int,
+                    total: int,
+                    completed_chunk_index: int,
+                    completed_translation: str
+                ):
+                    """
+                    Actualiza el progreso y la vista en vivo cuando termina
+                    cualquiera de los chunks concurrentes.
+                    """
+                
+                    # Progreso del documento actual.
+                    document_progress = completed / total
+                
+                    current_overall = (
+                        doc_idx + document_progress
+                    ) / total_files
+                
+                    overall_progress_bar.progress(
+                        min(current_overall, 1.0)
+                    )
+                
                     status_text.markdown(
                         f"📄 **Doc {doc_idx + 1}/{total_files}** (`{file_name}`) — "
-                        f"Traduciendo fragmento **{chunk_idx + 1}/{total_chunks}** al {selected_language}..."
+                        f"Traducidos **{completed}/{total} fragmentos** "
+                        f"al {selected_language}..."
                     )
-
-                    # Ejecutar traducción según el modo seleccionado
-                    if LANGCHAIN_AVAILABLE and "Agente" in translation_mode and agent_executor is not None:
-                        trans_result = translate_chunk_agent(agent_executor, chunk, selected_language)
-                    else:
-                        trans_result = translate_chunk_direct(
-                            chunk=chunk,
-                            target_language=selected_language,
-                            api_key=api_key,
-                            model_name=model_choice
-                        )
-
-                    translated_chunks.append(trans_result)
-
-                    # Vista comparativa en vivo (Live Review)
+                
+                    # Mostrar el último fragmento que haya terminado.
+                    original_chunk = chunks[completed_chunk_index]
+                
                     live_container.empty()
+                
                     with live_container.container():
-                        st.markdown(f"##### 🔍 Vista en Vivo — `{file_name}` (Fragmento {chunk_idx + 1}/{total_chunks})")
+                
+                        st.markdown(
+                            f"##### 🔍 Vista en Vivo — `{file_name}` "
+                            f"(Fragmento {completed_chunk_index + 1}/{total})"
+                        )
+                
                         c1, c2 = st.columns(2)
+                
                         with c1:
-                            st.caption("📝 Texto Original (Extracción 2 columnas)")
+                            st.caption(
+                                "📝 Texto Original "
+                                "(Extracción 2 columnas)"
+                            )
+                
                             st.text_area(
                                 "Original",
-                                value=chunk[:500] + ("..." if len(chunk) > 500 else ""),
+                                value=(
+                                    original_chunk[:500]
+                                    + ("..." if len(original_chunk) > 500 else "")
+                                ),
                                 height=110,
-                                key=f"live_orig_{doc_idx}_{chunk_idx}_{chunk_idx}",
+                                key=f"live_orig_{doc_idx}_{completed_chunk_index}",
                                 disabled=True,
                                 label_visibility="collapsed"
                             )
+                
                         with c2:
-                            st.caption(f"✨ Traducción ({selected_language})")
+                            st.caption(
+                                f"✨ Traducción ({selected_language})"
+                            )
+                
                             st.text_area(
                                 "Traducido",
-                                value=trans_result[:500] + ("..." if len(trans_result) > 500 else ""),
+                                value=(
+                                    completed_translation[:500]
+                                    + (
+                                        "..."
+                                        if len(completed_translation) > 500
+                                        else ""
+                                    )
+                                ),
                                 height=110,
-                                key=f"live_trans_{doc_idx}_{chunk_idx}_{chunk_idx}",
+                                key=f"live_trans_{doc_idx}_{completed_chunk_index}",
                                 disabled=True,
                                 label_visibility="collapsed"
                             )
+                
+                
+                # Ejecutar las traducciones concurrentemente
+                translated_chunks = translate_chunks_concurrent(
+                    chunks=chunks,
+                    target_language=selected_language,
+                    api_key=api_key,
+                    model_name=model_choice,
+                    max_workers=MAX_CONCURRENT_REQUESTS,
+                    progress_callback=update_translation_progress
+                )
 
                 # Unir el texto traducido completo para este documento
                 full_translated_doc = "\n\n".join(translated_chunks)
