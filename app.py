@@ -8,6 +8,7 @@ Streamlit + Google Gemini + LangChain + PyMuPDF + python-docx
 import io
 import re
 import zipfile
+import time
 from typing import List, Tuple, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
@@ -15,6 +16,13 @@ import streamlit as st
 # Número máximo de solicitudes simultáneas a Gemini.
 # Se mantiene controlado para evitar saturar la API.
 MAX_CONCURRENT_REQUESTS = 5
+
+# Configuración de reintentos para errores de cuota/rate limit de Gemini.
+MAX_RETRIES = 3
+
+# Tiempo de espera de seguridad si Gemini no proporciona
+# correctamente el retry_delay.
+DEFAULT_RETRY_DELAY = 60
 
 # Librerías para extracción de PDF
 try:
@@ -265,13 +273,11 @@ def segment_text_into_chunks(text: str, max_chars: int = 1900) -> List[str]:
 def translate_chunk_direct(
     chunk: str,
     target_language: str,
-    api_key: str,
-    model_name: str = "gemini-3.6-flash"
+    model
 ) -> str:
     """
     Traduce un fragmento individual utilizando la API de Google Gemini en modo directo.
     """
-    genai.configure(api_key=api_key)
 
     system_instruction = (
         "Eres un traductor académico profesional y riguroso, especializado en papers científicos y "
@@ -287,14 +293,6 @@ def translate_chunk_direct(
         "6. Preserva los saltos de línea y la estructura de párrafos original del texto."
     )
 
-    model = genai.GenerativeModel(
-        model_name=model_name,
-        system_instruction=system_instruction,
-        generation_config={
-            "temperature": 0.2,
-            "top_p": 0.95,
-        }
-    )
 
     prompt = f"Texto a traducir:\n\n{chunk}"
     response = model.generate_content(prompt)
@@ -307,8 +305,7 @@ def translate_chunk_direct(
 def translate_chunks_concurrent(
     chunks: List[str],
     target_language: str,
-    api_key: str,
-    model_name: str = "gemini-3.6-flash",
+    model,
     max_workers: int = MAX_CONCURRENT_REQUESTS,
     progress_callback=None,
     live_callback=None
@@ -346,11 +343,10 @@ def translate_chunks_concurrent(
         # Crear todas las tareas.
         future_to_index = {
             executor.submit(
-                translate_chunk_direct,
+                translate_chunk_with_retry,
                 chunk=chunk,
                 target_language=target_language,
-                api_key=api_key,
-                model_name=model_name
+                model=model
             ): index
             for index, chunk in enumerate(chunks)
         }
@@ -367,12 +363,11 @@ def translate_chunks_concurrent(
                 translated_chunks[chunk_index] = result
 
             except Exception as e:
-                # Si un chunk falla, conservar el texto original
-                # para no perder todo el documento.
-                translated_chunks[chunk_index] = chunks[chunk_index]
 
-                st.warning(
-                    f"⚠️ Error traduciendo el fragmento "
+                translated_chunks[chunk_index] = chunks[chunk_index]
+            
+                st.error(
+                    f"❌ Error definitivo traduciendo el fragmento "
                     f"{chunk_index + 1}: {str(e)}"
                 )
 
@@ -389,6 +384,110 @@ def translate_chunks_concurrent(
 
     return translated_chunks
 
+def get_retry_delay_from_error(error: Exception) -> int:
+    """
+    Extrae el tiempo de espera recomendado por Gemini desde
+    el mensaje del error 429.
+
+    Gemini puede devolver mensajes como:
+
+        Please retry in 59.509833912s.
+
+    o:
+
+        retry_delay { seconds: 59 }
+
+    Si no se encuentra ninguno, se utiliza DEFAULT_RETRY_DELAY.
+    """
+
+    error_message = str(error)
+
+    # Intentar obtener:
+    # "Please retry in 59.509833912s"
+    match = re.search(
+        r"Please retry in\s+([\d.]+)s",
+        error_message,
+        re.IGNORECASE
+    )
+
+    if match:
+        return max(1, int(float(match.group(1))) + 1)
+
+    # Intentar obtener:
+    # "retry_delay { seconds: 59 }"
+    match = re.search(
+        r"retry_delay\s*\{\s*seconds:\s*(\d+)",
+        error_message,
+        re.IGNORECASE
+    )
+
+    if match:
+        return max(1, int(match.group(1)) + 1)
+
+    # Si Gemini no proporciona el tiempo, utilizar
+    # el valor de seguridad.
+    return DEFAULT_RETRY_DELAY
+
+def translate_chunk_with_retry(
+    chunk: str,
+    target_language: str,
+    model,
+    max_retries: int = MAX_RETRIES
+) -> str:
+    """
+    Traduce un chunk y reintenta automáticamente cuando Gemini
+    devuelve un error 429 de cuota/rate limit.
+
+    Respeta el retry_delay indicado por Gemini.
+    """
+
+    attempt = 0
+
+    while True:
+
+        try:
+            return translate_chunk_direct(
+                chunk=chunk,
+                target_language=target_language,
+                model=model
+            )
+
+        except Exception as e:
+
+            error_message = str(e)
+
+            # Comprobar si se trata de un error 429.
+            is_rate_limit = (
+                "429" in error_message
+                or "quota exceeded" in error_message.lower()
+                or "rate limit" in error_message.lower()
+            )
+
+            # Si no es un error de cuota/rate limit,
+            # no tiene sentido reintentarlo aquí.
+            if not is_rate_limit:
+                raise
+
+            # Comprobar si todavía podemos reintentar.
+            if attempt >= max_retries:
+                raise RuntimeError(
+                    f"Gemini mantuvo el error 429 después de "
+                    f"{max_retries} reintentos."
+                ) from e
+
+            # Obtener el tiempo recomendado por Gemini.
+            retry_delay = get_retry_delay_from_error(e)
+
+            attempt += 1
+
+            st.warning(
+                f"⏳ Límite de Gemini alcanzado. "
+                f"Reintentando en {retry_delay} segundos "
+                f"(intento {attempt}/{max_retries})..."
+            )
+
+            # Esperar el tiempo indicado por Gemini.
+            time.sleep(retry_delay)
 
 # =============================================================================
 # 4. TRADUCCIÓN: MODO AGENTE (LangChain + Gemini + Tools)
@@ -758,6 +857,12 @@ def main():
                     continue
 
                 # 3. Traducción concurrente con visualización en vivo
+
+                # Crear la instancia de Gemini una sola vez.
+                genai.configure(api_key=api_key)
+                
+                gemini_model = genai.GenerativeModel(model_choice)
+                
                 translated_chunks: List[str] = [None] * total_chunks
                 
                 
@@ -847,8 +952,7 @@ def main():
                 translated_chunks = translate_chunks_concurrent(
                     chunks=chunks,
                     target_language=selected_language,
-                    api_key=api_key,
-                    model_name=model_choice,
+                    model=gemini_model,
                     max_workers=MAX_CONCURRENT_REQUESTS,
                     progress_callback=update_translation_progress
                 )
