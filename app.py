@@ -368,13 +368,15 @@ def translate_chunk_direct(
 
     prompt = f"Texto a traducir:\n\n{chunk}"
 
+    prompt = (
+        f"{system_instruction}\n\n"
+        "Texto a traducir:\n\n"
+        f"{chunk}"
+    )
+
     response = client.models.generate_content(
         model=model_name,
-        contents=prompt,
-        config={
-            "system_instruction": system_instruction,
-            "temperature": 0.1,
-        }
+        contents=prompt
     )
 
     if response and response.text:
@@ -519,10 +521,8 @@ def translate_chunk_with_retry(
     max_retries: int = MAX_RETRIES
 ) -> str:
     """
-    Traduce un chunk y reintenta automáticamente cuando Gemini
-    devuelve un error 429 de cuota/rate limit.
-
-    Respeta el retry_delay indicado por Gemini.
+    Traduce un chunk y reintenta automáticamente ante errores
+    temporales de Gemini como 429 y 503.
     """
 
     attempt = 0
@@ -540,28 +540,44 @@ def translate_chunk_with_retry(
         except Exception as e:
 
             error_message = str(e)
+            error_lower = error_message.lower()
 
-            is_rate_limit = (
+            is_temporary_error = (
                 "429" in error_message
-                or "quota exceeded" in error_message.lower()
-                or "rate limit" in error_message.lower()
+                or "503" in error_message
+                or "quota exceeded" in error_lower
+                or "rate limit" in error_lower
+                or "unavailable" in error_lower
+                or "high demand" in error_lower
+                or "temporarily" in error_lower
             )
 
-            if not is_rate_limit:
+            if not is_temporary_error:
                 raise
 
             if attempt >= max_retries:
                 raise RuntimeError(
-                    f"Gemini mantuvo el error 429 después de "
-                    f"{max_retries} reintentos."
+                    f"Gemini no pudo procesar el fragmento después de "
+                    f"{max_retries} reintentos. "
+                    f"Último error: {error_message}"
                 ) from e
 
+            # Primero intentamos obtener el retry_delay
             retry_delay = get_retry_delay_from_error(e)
+
+            # Para 503 normalmente Gemini no proporciona retry_delay.
+            # Aplicamos backoff progresivo.
+            if "503" in error_message:
+                retry_delay = min(
+                    15 * (2 ** attempt),
+                    60
+                )
 
             attempt += 1
 
             st.warning(
-                f"⏳ Límite de Gemini alcanzado. "
+                f"⏳ Gemini respondió temporalmente con un error "
+                f"({('503' if '503' in error_message else '429')}). "
                 f"Reintentando en {retry_delay} segundos "
                 f"(intento {attempt}/{max_retries})..."
             )
