@@ -202,17 +202,33 @@ def extract_pdf_content(file_bytes: bytes, filename: str) -> Tuple[str, str, boo
 # 2. SEGMENTACIÓN INTELIGENTE (Párrafos y Frases sin corte abrupto)
 # =============================================================================
 
-def segment_text_into_chunks(text: str, max_chars: int = 1900) -> List[str]:
+def segment_text_into_chunks(text: str, max_chars: int = 4000) -> List[str]:
     """
-    Divide el texto en fragmentos de ~1800-2000 caracteres respetando
-    párrafos y oraciones completas.
+    Divide el texto en fragmentos de hasta ~4000 caracteres,
+    respetando párrafos y oraciones completas siempre que sea posible.
+
+    Si un párrafo supera el tamaño máximo, se divide por oraciones
+    para evitar cortes abruptos en medio de una idea.
+
+    Args:
+        text: Texto completo extraído del PDF.
+        max_chars: Número máximo aproximado de caracteres por fragmento.
+
+    Returns:
+        Lista de fragmentos de texto listos para ser traducidos.
     """
     if not text or not text.strip():
         return []
 
-    # Normalizar saltos de línea continuos y caracteres especiales
+    # Normalizar saltos de línea
     normalized_text = text.replace('\r\n', '\n').replace('\r', '\n')
-    raw_paragraphs = [p.strip() for p in normalized_text.split('\n\n') if p.strip()]
+
+    # Separar por párrafos
+    raw_paragraphs = [
+        p.strip()
+        for p in normalized_text.split('\n\n')
+        if p.strip()
+    ]
 
     chunks: List[str] = []
     current_chunk: List[str] = []
@@ -221,47 +237,101 @@ def segment_text_into_chunks(text: str, max_chars: int = 1900) -> List[str]:
     for paragraph in raw_paragraphs:
         p_len = len(paragraph)
 
-        # Si el párrafo cabe en el fragmento actual
+        # -------------------------------------------------------------
+        # CASO 1: El párrafo cabe dentro del chunk actual
+        # -------------------------------------------------------------
         if current_length + p_len + 2 <= max_chars:
+
             current_chunk.append(paragraph)
             current_length += p_len + 2
+
         else:
-            # Si el párrafo por sí solo supera el tamaño máximo, dividir por oraciones
+
+            # ---------------------------------------------------------
+            # CASO 2: El párrafo supera por sí solo el tamaño máximo
+            # ---------------------------------------------------------
             if p_len > max_chars:
+
+                # Guardar primero el chunk acumulado
                 if current_chunk:
-                    chunks.append("\n\n".join(current_chunk))
+                    chunks.append(
+                        "\n\n".join(current_chunk)
+                    )
+
                     current_chunk = []
                     current_length = 0
 
-                # División por oraciones usando expresión regular segura
-                sentences = re.split(r'(?<=[.!?])\s+', paragraph)
+                # Dividir el párrafo por oraciones completas
+                sentences = re.split(
+                    r'(?<=[.!?])\s+',
+                    paragraph
+                )
+
                 temp_sentence_chunk: List[str] = []
                 temp_len = 0
 
-                for sent in sentences:
-                    s_clean = sent.strip()
-                    if not s_clean:
-                        continue
-                    if temp_len + len(s_clean) + 1 <= max_chars:
-                        temp_sentence_chunk.append(s_clean)
-                        temp_len += len(s_clean) + 1
-                    else:
-                        if temp_sentence_chunk:
-                            chunks.append(" ".join(temp_sentence_chunk))
-                        temp_sentence_chunk = [s_clean]
-                        temp_len = len(s_clean)
+                for sentence in sentences:
 
+                    sentence_clean = sentence.strip()
+
+                    if not sentence_clean:
+                        continue
+
+                    sentence_len = len(sentence_clean)
+
+                    # La oración todavía cabe
+                    if temp_len + sentence_len + 1 <= max_chars:
+
+                        temp_sentence_chunk.append(
+                            sentence_clean
+                        )
+
+                        temp_len += sentence_len + 1
+
+                    else:
+
+                        # Guardar el grupo de oraciones anterior
+                        if temp_sentence_chunk:
+                            chunks.append(
+                                " ".join(temp_sentence_chunk)
+                            )
+
+                        # Comenzar nuevo fragmento
+                        temp_sentence_chunk = [
+                            sentence_clean
+                        ]
+
+                        temp_len = sentence_len
+
+                # Guardar las últimas oraciones pendientes
                 if temp_sentence_chunk:
-                    chunks.append(" ".join(temp_sentence_chunk))
+                    chunks.append(
+                        " ".join(temp_sentence_chunk)
+                    )
+
+            # ---------------------------------------------------------
+            # CASO 3: El párrafo cabe en un chunk nuevo,
+            # pero no en el chunk actual
+            # ---------------------------------------------------------
             else:
-                # Guardar el chunk acumulado y empezar uno nuevo con este párrafo
+
+                # Guardar el chunk actual
                 if current_chunk:
-                    chunks.append("\n\n".join(current_chunk))
+                    chunks.append(
+                        "\n\n".join(current_chunk)
+                    )
+
+                # Comenzar un nuevo chunk con este párrafo
                 current_chunk = [paragraph]
                 current_length = p_len
 
+    # -------------------------------------------------------------
+    # Guardar el último chunk pendiente
+    # -------------------------------------------------------------
     if current_chunk:
-        chunks.append("\n\n".join(current_chunk))
+        chunks.append(
+            "\n\n".join(current_chunk)
+        )
 
     return chunks
 
@@ -797,11 +867,15 @@ def main():
         with st.expander("Ajustes avanzados de segmentación"):
             chunk_size = st.slider(
                 "Tamaño máx. por fragmento (caracteres)",
-                min_value=1000,
-                max_value=2500,
-                value=1900,
-                step=100,
-                help="Tamaño óptimo para balancear contexto académico y límites de tokens."
+                min_value=2000,
+                max_value=5000,
+                value=4000,
+                step=250,
+                help=(
+                    "Tamaño máximo de cada fragmento enviado a Gemini. "
+                    "Fragmentos más grandes reducen la cantidad de solicitudes, "
+                    "pero requieren más tokens por solicitud."
+                )
             )
 
         st.info("💡 **Tip**: Para papers a 2 columnas, el sistema reordena automáticamente la lectura de la columna izquierda antes de la derecha.")
