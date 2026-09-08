@@ -588,7 +588,7 @@ def translate_chunk_with_retry(
 # 4. TRADUCCIÓN: MODO AGENTE (LangChain + Gemini + Tools)
 # =============================================================================
 
-# Mapeo de códigos ISO a nombres de idiomas para comprobación
+# Mapeo de códigos ISO a nombres de idiomas
 LANG_CODE_MAP = {
     "español": "es",
     "spanish": "es",
@@ -604,67 +604,211 @@ LANG_CODE_MAP = {
     "italian": "it",
 }
 
+
+def normalize_language_code(language: str) -> str:
+    """
+    Convierte el nombre del idioma a su código ISO.
+    
+    Ejemplos:
+        Español -> es
+        Inglés  -> en
+        Francés -> fr
+    """
+
+    if not language:
+        return "unknown"
+
+    normalized = language.strip().lower()
+
+    return LANG_CODE_MAP.get(
+        normalized,
+        normalized[:2]
+    )
+
+
 def create_translation_agent_executor(
     api_key: str,
     target_language: str,
     model_name: str = "gemini-3.6-flash"
 ):
     """
-    Crea un agente de LangGraph con dos herramientas:
-    1. Detección de idioma.
-    2. Traducción académica especializada con Gemini.
+    Crea el agente supervisor de traducción.
+
+    IMPORTANTE:
+    El agente NO implementa un motor de traducción independiente.
+
+    El agente únicamente:
+        1. Detecta el idioma.
+        2. Decide si es necesario traducir.
+        3. Utiliza translate_academic_text_tool.
+
+    El motor real de traducción es el mismo utilizado
+    por el Modo Directo.
     """
+
+    if not LANGCHAIN_AVAILABLE:
+        raise RuntimeError(
+            "Las dependencias de LangChain/LangGraph no están disponibles."
+        )
+
+    # -------------------------------------------------------------------------
+    # Motor Gemini utilizado por las herramientas del agente
+    # -------------------------------------------------------------------------
+
     llm = ChatGoogleGenerativeAI(
         model=model_name,
         google_api_key=api_key,
         temperature=0.1,
     )
 
+    # -------------------------------------------------------------------------
+    # Herramienta 1: detección de idioma
+    # -------------------------------------------------------------------------
+
     @tool
     def detect_language_tool(text: str) -> str:
         """
-        Detecta el idioma predominante de un texto y devuelve su código ISO (ej: 'en', 'es', 'fr', 'pt').
+        Detecta el idioma predominante del fragmento.
+
+        Devuelve un código ISO como:
+            es = español
+            en = inglés
+            fr = francés
+            pt = portugués
+            de = alemán
+            it = italiano
         """
+
         try:
-            sample = text[:500].strip()
+
+            sample = text[:1000].strip()
+
             if not sample:
                 return "unknown"
+
             lang_code = detect(sample)
+
             return lang_code
+
         except Exception:
             return "unknown"
 
-    @tool
-    def translate_academic_text_tool(text: str, target_lang: str) -> str:
-        """
-        Traduce un fragmento académico al idioma de destino respetando terminología,
-        fórmulas matemáticas, citas bibliográficas y nombres propios.
-        """
-        try:
-            translation_prompt = (
-                f"Traduce el siguiente fragmento académico al idioma {target_lang}. "
-                "Devuelve ÚNICAMENTE la traducción exacta sin comentarios, preámbulos ni notas adicionales. "
-                "NO traduzcas fórmulas, referencias bibliográficas ni nombres propios:\n\n"
-                f"{text}"
-            )
-            res = llm.invoke(translation_prompt)
-            return res.content if hasattr(res, 'content') else str(res)
-        except Exception as e:
-            return f"Error en traducción: {str(e)}"
+    # -------------------------------------------------------------------------
+    # Herramienta 2: traducción académica
+    # -------------------------------------------------------------------------
 
-    tools = [detect_language_tool, translate_academic_text_tool]
+    @tool
+    def translate_academic_text_tool(
+        text: str,
+        target_lang: str
+    ) -> str:
+        """
+        Traduce un fragmento académico utilizando el mismo LLM
+        configurado para el agente.
+        """
+
+        if not text or not text.strip():
+            return text
+
+        translation_prompt = (
+            "Eres un traductor académico profesional especializado "
+            "en papers científicos y publicaciones universitarias.\n\n"
+
+            f"Traduce el siguiente texto al idioma {target_lang}.\n\n"
+
+            "REGLAS OBLIGATORIAS:\n"
+            "1. Devuelve ÚNICAMENTE la traducción.\n"
+            "2. No agregues explicaciones, comentarios, etiquetas "
+            "ni preámbulos.\n"
+            "3. Mantén la terminología técnica y el tono académico.\n"
+            "4. NO traduzcas fórmulas matemáticas, ecuaciones, "
+            "variables ni código.\n"
+            "5. NO traduzcas referencias bibliográficas ni claves "
+            "de citación estándar como [1] o (Smith et al., 2021).\n"
+            "6. NO traduzcas nombres propios de autores, universidades "
+            "ni afiliaciones institucionales.\n"
+            "7. Conserva la estructura de párrafos y saltos de línea "
+            "cuando sea posible.\n\n"
+
+            "TEXTO A TRADUCIR:\n\n"
+            f"{text}"
+        )
+
+        response = llm.invoke(translation_prompt)
+
+        if hasattr(response, "content"):
+            return str(response.content).strip()
+
+        return str(response).strip()
+
+    # -------------------------------------------------------------------------
+    # Herramientas disponibles para el agente
+    # -------------------------------------------------------------------------
+
+    tools = [
+        detect_language_tool,
+        translate_academic_text_tool
+    ]
+
+    # -------------------------------------------------------------------------
+    # Instrucciones del agente
+    # -------------------------------------------------------------------------
 
     system_message = (
-        "Eres un agente supervisor de traducción académica para papers científicos.\n"
-        f"El idioma objetivo deseado por el usuario es: '{target_language}'.\n\n"
-        "Tu flujo de trabajo obligatorio:\n"
-        "1. Usa la herramienta 'detect_language_tool' para verificar el idioma del fragmento.\n"
-        "2. Si el fragmento ya está en el idioma objetivo deseado, devuélvelo exactamente igual sin traducirlo.\n"
-        "3. Si el fragmento está en un idioma diferente, usa 'translate_academic_text_tool' para traducirlo al idioma objetivo.\n"
-        "4. Tu respuesta final debe ser EXCLUSIVAMENTE el texto traducido o mantenido, sin explicaciones ni etiquetas."
+        "Eres un agente supervisor de traducción académica.\n\n"
+
+        f"El idioma objetivo es: {target_language}.\n"
+        f"El código ISO del idioma objetivo es: "
+        f"{normalize_language_code(target_language)}.\n\n"
+
+        "FLUJO OBLIGATORIO:\n"
+
+        "1. Utiliza detect_language_tool para identificar "
+        "el idioma del fragmento.\n\n"
+
+        "2. Si el idioma detectado coincide con el idioma objetivo, "
+        "devuelve el fragmento exactamente igual.\n\n"
+
+        "3. Si el idioma detectado es diferente al idioma objetivo, "
+        "utiliza translate_academic_text_tool.\n\n"
+
+        "4. No inventes contenido.\n\n"
+
+        "5. No resumas el texto.\n\n"
+
+        "6. No elimines información.\n\n"
+
+        "7. La respuesta final debe contener EXCLUSIVAMENTE "
+        "el texto traducido o el texto original cuando no sea "
+        "necesaria la traducción."
     )
 
-    agent = create_react_agent(llm, tools, state_modifier=system_message)
+    # -------------------------------------------------------------------------
+    # Compatibilidad con versiones actuales de LangGraph
+    # -------------------------------------------------------------------------
+
+    try:
+
+        # Las versiones actuales de LangGraph utilizan `prompt`
+        # en lugar de `state_modifier`.
+
+        agent = create_react_agent(
+            model=llm,
+            tools=tools,
+            prompt=system_message
+        )
+
+    except TypeError:
+
+        # Compatibilidad adicional con algunas versiones
+        # que utilizan el primer argumento posicional.
+
+        agent = create_react_agent(
+            llm,
+            tools,
+            prompt=system_message
+        )
+
     return agent
 
 
@@ -674,16 +818,134 @@ def translate_chunk_agent(
     target_language: str
 ) -> str:
     """
-    Ejecuta el agente de LangGraph para un fragmento específico.
+    Procesa un chunk mediante el agente.
+
+    El agente decide si debe conservarlo o traducirlo.
     """
-    try:
-        result = agent_executor.invoke({"messages": [("human", f"Procesa y traduce este fragmento si es necesario:\n\n{chunk}")]})
-        output = result["messages"][-1].content
-        return str(output).strip()
-    except Exception as e:
-        st.warning(f"Aviso del Agente: {str(e)}. Usando traducción directa de respaldo.")
-        # Fallback rápido
+
+    if not chunk or not chunk.strip():
         return chunk
+
+    try:
+
+        target_code = normalize_language_code(target_language)
+
+        user_message = (
+            f"Procesa el siguiente fragmento académico.\n\n"
+            f"Idioma objetivo: {target_language} ({target_code}).\n\n"
+            "Debes detectar primero el idioma y posteriormente "
+            "traducir únicamente si es necesario.\n\n"
+            "FRAGMENTO:\n\n"
+            f"{chunk}"
+        )
+
+        result = agent_executor.invoke(
+            {
+                "messages": [
+                    (
+                        "human",
+                        user_message
+                    )
+                ]
+            }
+        )
+
+        messages = result.get("messages", [])
+
+        if not messages:
+            return chunk
+
+        # Obtener el último mensaje generado por el agente.
+        output = messages[-1]
+
+        if hasattr(output, "content"):
+            content = output.content
+        else:
+            content = str(output)
+
+        if not content:
+            return chunk
+
+        return str(content).strip()
+
+    except Exception as e:
+
+        st.warning(
+            "⚠️ El agente no pudo procesar el fragmento. "
+            f"Se conservará el texto original. Detalle: {str(e)}"
+        )
+
+        return chunk
+
+
+def translate_chunks_agent_concurrent(
+    chunks: List[str],
+    target_language: str,
+    agent_executor,
+    max_workers: int = MAX_CONCURRENT_REQUESTS,
+    progress_callback=None
+) -> List[str]:
+    """
+    Traduce los chunks mediante el agente manteniendo
+    el orden original.
+
+    NOTA:
+    Se mantiene una función separada del motor directo para
+    que ambos modos puedan evolucionar independientemente.
+    """
+
+    if not chunks:
+        return []
+
+    translated_chunks = [None] * len(chunks)
+
+    completed = 0
+
+    with ThreadPoolExecutor(
+        max_workers=max_workers
+    ) as executor:
+
+        future_to_index = {
+            executor.submit(
+                translate_chunk_agent,
+                agent_executor,
+                chunk,
+                target_language
+            ): index
+            for index, chunk in enumerate(chunks)
+        }
+
+        for future in as_completed(future_to_index):
+
+            chunk_index = future_to_index[future]
+
+            try:
+
+                result = future.result()
+
+                translated_chunks[chunk_index] = result
+
+            except Exception as e:
+
+                translated_chunks[chunk_index] = chunks[chunk_index]
+
+                st.error(
+                    f"❌ Error procesando el fragmento "
+                    f"{chunk_index + 1} mediante el agente: {str(e)}"
+                )
+
+            completed += 1
+
+            if progress_callback:
+
+                progress_callback(
+                    completed,
+                    len(chunks),
+                    chunk_index,
+                    translated_chunks[chunk_index]
+                )
+
+    return translated_chunks
 
 
 # =============================================================================
@@ -1047,15 +1309,30 @@ def main():
                             )
                 
                 
-                # Ejecutar las traducciones concurrentemente
-                translated_chunks = translate_chunks_concurrent(
-                    chunks=chunks,
-                    target_language=selected_language,
-                    client=gemini_client,
-                    model_name=model_choice,
-                    max_workers=MAX_CONCURRENT_REQUESTS,
-                    progress_callback=update_translation_progress
-                )
+                # =========================================================================
+                # Ejecutar traducción según el modo seleccionado
+                # =========================================================================
+                
+                if "Agente" in translation_mode:
+                
+                    translated_chunks = translate_chunks_agent_concurrent(
+                        chunks=chunks,
+                        target_language=selected_language,
+                        agent_executor=agent_executor,
+                        max_workers=MAX_CONCURRENT_REQUESTS,
+                        progress_callback=update_translation_progress
+                    )
+                
+                else:
+                
+                    translated_chunks = translate_chunks_concurrent(
+                        chunks=chunks,
+                        target_language=selected_language,
+                        client=gemini_client,
+                        model_name=model_choice,
+                        max_workers=MAX_CONCURRENT_REQUESTS,
+                        progress_callback=update_translation_progress
+                    )
 
                 # Unir el texto traducido completo para este documento
                 full_translated_doc = "\n\n".join(translated_chunks)
