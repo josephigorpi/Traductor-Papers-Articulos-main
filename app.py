@@ -203,7 +203,11 @@ def extract_pdf_content(file_bytes: bytes, filename: str) -> Tuple[str, str, boo
 # 2. SEGMENTACIÓN INTELIGENTE (Párrafos y Frases sin corte abrupto)
 # =============================================================================
 
-def segment_text_into_chunks(text: str, max_chars: int = 4000) -> List[str]:
+def segment_text_into_chunks(
+    text: str,
+    max_chars: int = 4000,
+    target_chunks: Optional[int] = None
+) -> List[str]:
     """
     Divide el texto en fragmentos de hasta ~4000 caracteres,
     respetando párrafos y oraciones completas siempre que sea posible.
@@ -1495,19 +1499,58 @@ def main():
 
         # 5. Parámetros de segmentación
         with st.expander("Ajustes avanzados de segmentación"):
+        
+            # ---------------------------------------------------------
+            # Tamaño máximo de cada chunk
+            # ---------------------------------------------------------
             chunk_size = st.slider(
-                "Tamaño máx. por fragmento (caracteres)",
+                "📏 Tamaño máx. por fragmento (caracteres)",
                 min_value=2000,
                 max_value=5000,
                 value=4000,
                 step=250,
                 help=(
-                    "Tamaño máximo de cada fragmento enviado a Gemini. "
-                    "Fragmentos más grandes reducen la cantidad de solicitudes, "
-                    "pero requieren más tokens por solicitud."
+                    "Establece el tamaño máximo permitido para cada fragmento. "
+                    "Este límite siempre tiene prioridad para evitar enviar "
+                    "fragmentos demasiado grandes a Gemini."
                 )
             )
-
+        
+            # ---------------------------------------------------------
+            # Cantidad objetivo de chunks
+            # ---------------------------------------------------------
+            chunk_mode = st.radio(
+                "📦 Cantidad de fragmentos",
+                options=[
+                    "Automática",
+                    "Personalizada"
+                ],
+                index=0,
+                help=(
+                    "Automática: la cantidad de fragmentos se calcula según "
+                    "el tamaño del documento y el tamaño máximo configurado.\n\n"
+                    "Personalizada: se intenta aproximar la cantidad indicada, "
+                    "pero el tamaño máximo por fragmento siempre tiene prioridad."
+                )
+            )
+        
+            if chunk_mode == "Personalizada":
+        
+                target_chunks = st.number_input(
+                    "Cantidad objetivo de fragmentos",
+                    min_value=1,
+                    max_value=100,
+                    value=10,
+                    step=1,
+                    help=(
+                        "Cantidad aproximada de fragmentos que se desea generar. "
+                        "El sistema no superará el tamaño máximo configurado."
+                    )
+                )
+        
+            else:
+        
+                target_chunks = None
         st.info("💡 **Tip**: Para papers a 2 columnas, el sistema reordena automáticamente la lectura de la columna izquierda antes de la derecha.")
 
     # -------------------------------------------------------------------------
@@ -1584,7 +1627,11 @@ def main():
                     continue
 
                 # 2. Segmentación en fragmentos inteligentes
-                chunks = segment_text_into_chunks(raw_text, max_chars=chunk_size)
+                chunks = segment_text_into_chunks(
+                    raw_text,
+                    max_chars=chunk_size,
+                    target_chunks=target_chunks
+                )
                 total_chunks = len(chunks)
 
                 if total_chunks == 0:
