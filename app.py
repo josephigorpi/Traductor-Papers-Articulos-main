@@ -12,6 +12,7 @@ import time
 from typing import List, Tuple, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
+import json
 
 # Número máximo de solicitudes simultáneas a Gemini.
 # Se mantiene controlado para evitar saturar la API.
@@ -340,6 +341,45 @@ def segment_text_into_chunks(text: str, max_chars: int = 4000) -> List[str]:
 # 3. TRADUCCIÓN: MODO DIRECTO (Google Generative AI)
 # =============================================================================
 
+def build_translation_prompt(
+    chunk: str,
+    target_language: str
+) -> str:
+    """
+    Construye el prompt estándar utilizado tanto por el
+    modo Directo como por el modo Batch.
+    """
+
+    system_instruction = (
+        "Eres un traductor académico profesional y riguroso, "
+        "especializado en papers científicos y publicaciones universitarias.\n"
+        f"Tu tarea es traducir el texto recibido al idioma: {target_language}.\n\n"
+
+        "REGLAS OBLIGATORIAS:\n"
+        "1. Devuelve ÚNICAMENTE la traducción limpia del texto. "
+        "No agregues preámbulos, notas del traductor, saludos, "
+        "advertencias ni explicaciones adicionales.\n"
+
+        "2. Mantén la terminología técnica y el tono formal académico.\n"
+
+        "3. NO traduzcas fórmulas matemáticas, ecuaciones, variables "
+        "ni fragmentos de código.\n"
+
+        "4. NO traduzcas referencias bibliográficas ni claves de "
+        "citación estándar (ej. [1], (Smith et al., 2021)).\n"
+
+        "5. NO traduzcas nombres propios de autores, nombres de "
+        "universidades ni afiliaciones institucionales.\n"
+
+        "6. Preserva los saltos de línea y la estructura de "
+        "párrafos original del texto.\n\n"
+
+        "Texto a traducir:\n\n"
+        f"{chunk}"
+    )
+
+    return system_instruction
+
 def translate_chunk_direct(
     chunk: str,
     target_language: str,
@@ -347,31 +387,12 @@ def translate_chunk_direct(
     model_name: str
 ) -> str:
     """
-    Traduce un fragmento individual utilizando el SDK
-    oficial actual de Google GenAI.
+    Traduce un fragmento individual utilizando Gemini.
     """
 
-    system_instruction = (
-        "Eres un traductor académico profesional y riguroso, especializado en papers científicos y "
-        "publicaciones universitarias.\n"
-        f"Tu tarea es traducir el texto recibido al idioma: {target_language}.\n\n"
-        "REGLAS OBLIGATORIAS:\n"
-        "1. Devuelve ÚNICAMENTE la traducción limpia del texto. No agregues preámbulos, notas del traductor, "
-        "saludos, advertencias ni explicaciones adicionales.\n"
-        "2. Mantén la terminología técnica y el tono formal académico.\n"
-        "3. NO traduzcas fórmulas matemáticas, ecuaciones, variables ni fragmentos de código.\n"
-        "4. NO traduzcas referencias bibliográficas ni claves de citación estándar "
-        "(ej. [1], (Smith et al., 2021)).\n"
-        "5. NO traduzcas nombres propios de autores, nombres de universidades ni afiliaciones institucionales.\n"
-        "6. Preserva los saltos de línea y la estructura de párrafos original del texto."
-    )
-
-    prompt = f"Texto a traducir:\n\n{chunk}"
-
-    prompt = (
-        f"{system_instruction}\n\n"
-        "Texto a traducir:\n\n"
-        f"{chunk}"
+    prompt = build_translation_prompt(
+        chunk=chunk,
+        target_language=target_language
     )
 
     response = client.models.generate_content(
@@ -1036,10 +1057,325 @@ def generate_zip_package(translated_files_data: Dict[str, bytes]) -> io.BytesIO:
             zip_file.writestr(filename, file_bytes)
     zip_buffer.seek(0)
     return zip_buffer
+    
+# =============================================================================
+# 6. TRADUCCIÓN: MODO BATCH
+# =============================================================================
+
+def create_batch_jsonl(
+    chunks: List[str],
+    target_language: str,
+    output_path: str
+) -> str:
+    """
+    Genera un archivo JSONL compatible con Gemini Batch API.
+
+    Cada línea representa una solicitud independiente.
+    """
+
+    with open(output_path, "w", encoding="utf-8") as f:
+
+        for index, chunk in enumerate(chunks):
+
+            request = {
+                "key": f"chunk-{index}",
+                "request": {
+                    "contents": [
+                        {
+                            "role": "user",
+                            "parts": [
+                                {
+                                    "text": build_translation_prompt(
+                                        chunk=chunk,
+                                        target_language=target_language
+                                    )
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+
+            f.write(
+                json.dumps(
+                    request,
+                    ensure_ascii=False
+                ) + "\n"
+            )
+
+    return output_path
+
+def create_translation_batch(
+    chunks: List[str],
+    target_language: str,
+    client,
+    model_name: str
+):
+    """
+    Crea un trabajo Batch de Gemini para todos los chunks.
+    """
+
+    import tempfile
+    import os
+
+    temp_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".jsonl",
+        delete=False,
+        encoding="utf-8"
+    )
+
+    temp_file.close()
+
+    jsonl_path = create_batch_jsonl(
+        chunks=chunks,
+        target_language=target_language,
+        output_path=temp_file.name
+    )
+
+    try:
+
+        uploaded_file = client.files.upload(
+            file=jsonl_path
+        )
+
+        batch_job = client.batches.create(
+            model=model_name,
+            src=uploaded_file.name,
+            config={
+                "display_name": "paper-translation-batch"
+            }
+        )
+
+        return batch_job
+
+    finally:
+
+        try:
+            os.remove(jsonl_path)
+        except OSError:
+            pass
+
+def wait_for_batch_completion(
+    client,
+    batch_job,
+    poll_interval: int = 10
+):
+    """
+    Espera hasta que Gemini termine el procesamiento Batch.
+    """
+
+    while True:
+
+        batch_job = client.batches.get(
+            name=batch_job.name
+        )
+
+        state = batch_job.state.name
+
+        if state == "JOB_STATE_SUCCEEDED":
+            return batch_job
+
+        if state == "JOB_STATE_FAILED":
+            raise RuntimeError(
+                f"El Batch de Gemini falló: "
+                f"{getattr(batch_job, 'error', 'Error desconocido')}"
+            )
+
+        if state == "JOB_STATE_CANCELLED":
+            raise RuntimeError(
+                "El Batch de Gemini fue cancelado."
+            )
+
+        if state == "JOB_STATE_EXPIRED":
+            raise RuntimeError(
+                "El Batch de Gemini expiró después de 48 horas."
+            )
+
+        time.sleep(poll_interval)
+
+def extract_batch_results(
+    client,
+    batch_job,
+    chunks: List[str]
+) -> List[str]:
+    """
+    Extrae las traducciones generadas por Gemini Batch API
+    y las devuelve en el mismo orden de los chunks originales.
+    """
+
+    if not batch_job.dest:
+        raise RuntimeError(
+            "El Batch terminó correctamente pero no contiene destino."
+        )
+
+    result_file_name = batch_job.dest.file_name
+
+    if not result_file_name:
+        raise RuntimeError(
+            "No se encontró el archivo de resultados del Batch."
+        )
+
+    file_content = client.files.download(
+        file=result_file_name
+    )
+
+    if isinstance(file_content, bytes):
+        content = file_content.decode(
+            "utf-8",
+            errors="replace"
+        )
+    else:
+        content = str(file_content)
+
+    translated_chunks = [None] * len(chunks)
+
+    for line_number, line in enumerate(
+        content.splitlines()
+    ):
+
+        if not line.strip():
+            continue
+
+        try:
+
+            result = json.loads(line)
+
+            key = result.get("key", "")
+
+            match = re.search(
+                r"chunk-(\d+)",
+                key
+            )
+
+            if not match:
+                continue
+
+            chunk_index = int(
+                match.group(1)
+            )
+
+            response = result.get(
+                "response"
+            )
+
+            if not response:
+                translated_chunks[chunk_index] = chunks[chunk_index]
+                continue
+
+            candidates = response.get(
+                "candidates",
+                []
+            )
+
+            if not candidates:
+                translated_chunks[chunk_index] = chunks[chunk_index]
+                continue
+
+            parts = (
+                candidates[0]
+                .get("content", {})
+                .get("parts", [])
+            )
+
+            translated_text = "".join(
+                part.get("text", "")
+                for part in parts
+                if isinstance(part, dict)
+            ).strip()
+
+            if translated_text:
+                translated_chunks[chunk_index] = translated_text
+            else:
+                translated_chunks[chunk_index] = chunks[chunk_index]
+
+        except Exception as e:
+
+            st.warning(
+                f"⚠️ No se pudo procesar "
+                f"la línea {line_number + 1} "
+                f"del resultado Batch: {str(e)}"
+            )
+
+    # Protección final: ningún chunk queda como None
+    for index in range(len(translated_chunks)):
+
+        if not translated_chunks[index]:
+            translated_chunks[index] = chunks[index]
+
+    return translated_chunks
+
+def translate_chunks_batch(
+    chunks: List[str],
+    target_language: str,
+    client,
+    model_name: str,
+    progress_callback=None
+) -> List[str]:
+    """
+    Traduce todos los chunks utilizando Gemini Batch API.
+    """
+
+    if not chunks:
+        return []
+
+    st.info(
+        f"📦 Enviando {len(chunks)} fragmentos "
+        f"a Gemini Batch API..."
+    )
+
+    batch_job = create_translation_batch(
+        chunks=chunks,
+        target_language=target_language,
+        client=client,
+        model_name=model_name
+    )
+
+    st.success(
+        f"✅ Batch creado correctamente: "
+        f"`{batch_job.name}`"
+    )
+
+    st.info(
+        "⏳ Gemini está procesando el lote. "
+        "Este proceso es asíncrono y puede tardar."
+    )
+
+    completed_job = wait_for_batch_completion(
+        client=client,
+        batch_job=batch_job,
+        poll_interval=10
+    )
+
+    st.success(
+        "🎉 Gemini terminó de procesar el Batch."
+    )
+
+    translated_chunks = extract_batch_results(
+        client=client,
+        batch_job=completed_job,
+        chunks=chunks
+    )
+
+    if progress_callback:
+
+        for index, translation in enumerate(
+            translated_chunks
+        ):
+
+            progress_callback(
+                index + 1,
+                len(translated_chunks),
+                index,
+                translation
+            )
+
+    return translated_chunks
+
 
 
 # =============================================================================
-# 6. INTERFAZ STREAMLIT
+# 7. INTERFAZ STREAMLIT
 # =============================================================================
 
 def init_session_state():
@@ -1102,8 +1438,15 @@ def main():
 
         # 3. Selección de Modo de Traducción
         mode_options = ["Modo Directo (Gemini API)"]
+        mode_options = [
+            "Modo Directo (Gemini API)",
+            "Modo Batch (Gemini Batch API)"
+        ]
+        
         if LANGCHAIN_AVAILABLE:
-            mode_options.append("Modo Agente (LangChain + Gemini)")
+            mode_options.append(
+                "Modo Agente (LangChain + Gemini)"
+            )
         translation_mode = st.radio(
             "🧠 Modo de Traducción",
             options=mode_options,
@@ -1325,14 +1668,26 @@ def main():
                 
                 else:
                 
-                    translated_chunks = translate_chunks_concurrent(
-                        chunks=chunks,
-                        target_language=selected_language,
-                        client=gemini_client,
-                        model_name=model_choice,
-                        max_workers=MAX_CONCURRENT_REQUESTS,
-                        progress_callback=update_translation_progress
-                    )
+                    if "Batch" in translation_mode:
+
+                        translated_chunks = translate_chunks_batch(
+                            chunks=chunks,
+                            target_language=selected_language,
+                            client=gemini_client,
+                            model_name=model_choice,
+                            progress_callback=update_translation_progress
+                        )
+                    
+                    else:
+                    
+                        translated_chunks = translate_chunks_concurrent(
+                            chunks=chunks,
+                            target_language=selected_language,
+                            client=gemini_client,
+                            model_name=model_choice,
+                            max_workers=MAX_CONCURRENT_REQUESTS,
+                            progress_callback=update_translation_progress
+                        )
 
                 # Unir el texto traducido completo para este documento
                 full_translated_doc = "\n\n".join(translated_chunks)
