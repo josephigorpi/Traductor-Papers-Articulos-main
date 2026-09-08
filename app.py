@@ -1046,6 +1046,35 @@ def generate_docx(title: str, text_content: str, source_filename: str = "") -> i
     docx_io.seek(0)
     return docx_io
 
+def generate_txt(text_content: str) -> bytes:
+    """
+    Genera un archivo TXT con el contenido traducido.
+
+    El contenido se guarda en UTF-8 para preservar correctamente
+    caracteres especiales, tildes, símbolos y otros caracteres
+    utilizados en textos académicos.
+    """
+    if not text_content:
+        text_content = ""
+
+    return text_content.encode("utf-8")
+
+def generate_txt_content(text_content: str) -> bytes:
+    """
+    Genera el contenido de un archivo TXT a partir del texto traducido.
+
+    Se utiliza UTF-8 para conservar correctamente:
+    - tildes
+    - ñ
+    - caracteres científicos
+    - símbolos
+    - caracteres de otros idiomas
+    """
+
+    if not text_content:
+        text_content = ""
+
+    return text_content.encode("utf-8")
 
 def generate_zip_package(translated_files_data: Dict[str, bytes]) -> io.BytesIO:
     """
@@ -1695,18 +1724,30 @@ def main():
                 # Usar el título detectado o el nombre del archivo
                 doc_title = detected_title if detected_title else file_name.replace(".pdf", "").replace("_", " ")
 
-                # Generar .docx inicial
+                # -------------------------------------------------------------
+                # Generar .docx
+                # -------------------------------------------------------------
                 docx_file_io = generate_docx(
                     title=doc_title,
                     text_content=full_translated_doc,
                     source_filename=file_name
                 )
-
-                # Guardar en session_state para edición y descarga posterior
+                
+                # -------------------------------------------------------------
+                # Generar .txt
+                # -------------------------------------------------------------
+                txt_bytes = generate_txt(
+                    text_content=full_translated_doc
+                )
+                
+                # -------------------------------------------------------------
+                # Guardar resultados en session_state
+                # -------------------------------------------------------------
                 st.session_state.translated_docs[file_name] = {
                     "text": full_translated_doc,
                     "title": doc_title,
-                    "docx_bytes": docx_file_io.getvalue()
+                    "docx_bytes": docx_file_io.getvalue(),
+                    "txt_bytes": txt_bytes
                 }
 
             overall_progress_bar.progress(1.0)
@@ -1724,7 +1765,7 @@ def main():
             "Al hacer clic en **Actualizar DOCX**, los cambios se aplicarán al archivo final."
         )
 
-        docx_zip_dict: Dict[str, bytes] = {}
+        zip_files_dict: Dict[str, bytes] = {}
 
         for filename, doc_data in st.session_state.translated_docs.items():
             base_name = filename.rsplit('.', 1)[0]
@@ -1748,35 +1789,90 @@ def main():
 
                 # Si el usuario editó el texto o título, actualizar el docx en memoria
                 if (edited_text != doc_data["text"]) or (edit_title != doc_data["title"]):
+
+                    # Regenerar DOCX
                     updated_docx_io = generate_docx(
                         title=edit_title,
                         text_content=edited_text,
                         source_filename=filename
                     )
+                
+                    # Regenerar TXT
+                    updated_txt_bytes = generate_txt(
+                        text_content=edited_text
+                    )
+                
+                    # Actualizar memoria
                     doc_data["text"] = edited_text
                     doc_data["title"] = edit_title
                     doc_data["docx_bytes"] = updated_docx_io.getvalue()
+                    doc_data["txt_bytes"] = updated_txt_bytes
 
-                docx_zip_dict[docx_filename] = doc_data["docx_bytes"]
-
-                # Botón de descarga individual
-                st.download_button(
-                    label=f"📥 Descargar {docx_filename}",
-                    data=doc_data["docx_bytes"],
-                    file_name=docx_filename,
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    key=f"download_{filename}"
+                # Nombre del TXT
+                base_name = filename.rsplit('.', 1)[0]
+                
+                txt_filename = (
+                    f"{base_name}_traducido_{selected_language.lower()}.txt"
                 )
+                
+                # Agregar ambos archivos al ZIP
+                zip_files_dict[docx_filename] = doc_data["docx_bytes"]
+                zip_files_dict[txt_filename] = doc_data["txt_bytes"]
+
+                # -------------------------------------------------------------
+                # Botones de descarga
+                # -------------------------------------------------------------
+                
+                download_col1, download_col2 = st.columns(2)
+                
+                with download_col1:
+                
+                    st.download_button(
+                        label=f"📥 Descargar DOCX",
+                        data=doc_data["docx_bytes"],
+                        file_name=docx_filename,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key=f"download_docx_{filename}"
+                    )
+                    
+
+
+                
+                with download_col2:
+                
+                    base_name = filename.rsplit('.', 1)[0]
+                
+                    txt_filename = (
+                        f"{base_name}_traducido_{selected_language.lower()}.txt"
+                    )
+                
+                    st.download_button(
+                        label=f"📄 Descargar TXT",
+                        data=doc_data["txt_bytes"],
+                        file_name=txt_filename,
+                        mime="text/plain",
+                        key=f"download_txt_{filename}"
+                    )
 
         st.divider()
 
         # Botón para descargar todos los archivos en un ZIP
-        if docx_zip_dict:
-            zip_bytes = generate_zip_package(docx_zip_dict)
+        if zip_files_dict:
+        
+            zip_bytes = generate_zip_package(
+                zip_files_dict
+            )
+        
             st.download_button(
-                label=f"📦 Descargar TODOS los documentos traducidos (.ZIP) [{len(docx_zip_dict)} archivos]",
+                label=(
+                    f"📦 Descargar TODOS los documentos "
+                    f"(.ZIP) [{len(zip_files_dict)} archivos]"
+                ),
                 data=zip_bytes,
-                file_name=f"papers_traducidos_{selected_language.lower()}.zip",
+                file_name=(
+                    f"papers_traducidos_"
+                    f"{selected_language.lower()}.zip"
+                ),
                 mime="application/zip",
                 type="primary",
                 use_container_width=True
